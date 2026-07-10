@@ -252,9 +252,12 @@ export async function dbTrackerBaseline(month: string) {
 }
 
 export async function dbTrackerDaily(month: string) {
+  // half-open range [month-01, nextMonth-01) — avoids invalid dates like Nov 31
+  const [y, m] = month.split("-").map(Number);
+  const next = `${m === 12 ? y + 1 : y}-${String(m === 12 ? 1 : m + 1).padStart(2, "0")}-01`;
   return selectAll<{ date: string; asin: string; units: number }>((from, to) =>
     supa().from("business_reports_daily").select("date,asin,units")
-      .gte("date", `${month}-01`).lte("date", `${month}-31`).range(from, to),
+      .gte("date", `${month}-01`).lt("date", next).range(from, to),
   );
 }
 
