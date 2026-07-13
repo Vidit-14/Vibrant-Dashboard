@@ -1,6 +1,5 @@
 import "server-only";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
-import { cached, invalidate } from "./cache";
 import type { AdRow, TargetingRow, OrderRow, Country } from "./ads";
 import type { LogEntry } from "./logs";
 import type { CombinedRow } from "./returns";
@@ -12,7 +11,10 @@ import type { AllowedUser, LoginEvent } from "./users";
  * Supabase (Postgres) backend. Every function returns real data when
  * SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY are configured; `usingSupabase()`
  * is false otherwise and the libs fall back to the Google Sheets code paths.
- * Populate the tables with scripts/migrate-to-supabase.mjs.
+ *
+ * Reads are deliberately NOT cached server-side: on serverless hosts each
+ * instance has its own memory, so a per-instance cache serves stale data
+ * after uploads. Postgres is fast enough to query directly.
  */
 
 let client: SupabaseClient | null = null;
@@ -38,24 +40,47 @@ export function supa(): SupabaseClient {
 }
 
 const PAGE = 1000;
+const WAVE = 8; // parallel page requests
 
-/** Drain a PostgREST query in 1000-row pages (its per-request cap). */
+/**
+ * Drain a PostgREST query past its 1000-row page cap. Pages are fetched in
+ * parallel waves of 8, which matters when the function runs far from the DB.
+ */
 async function selectAll<T>(
   build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
 ): Promise<T[]> {
-  const out: T[] = [];
-  for (let from = 0; ; from += PAGE) {
-    const { data, error } = await build(from, from + PAGE - 1);
-    if (error) throw new Error(error.message);
-    if (!data?.length) break;
-    out.push(...data);
-    if (data.length < PAGE) break;
+  // single probe first — most queries fit in one page
+  const first = await build(0, PAGE - 1);
+  if (first.error) throw new Error(first.error.message);
+  const out: T[] = first.data ?? [];
+  if (out.length < PAGE) return out;
+
+  for (let wave = 0; ; wave++) {
+    const batch = await Promise.all(
+      Array.from({ length: WAVE }, (_, i) => {
+        const from = (1 + wave * WAVE + i) * PAGE;
+        return build(from, from + PAGE - 1);
+      }),
+    );
+    let done = false;
+    for (const { data, error } of batch) {
+      if (error) throw new Error(error.message);
+      if (data?.length) out.push(...data);
+      if (!data || data.length < PAGE) done = true;
+    }
+    if (done) return out;
   }
-  return out;
 }
 
 function fail(error: { message: string } | null) {
   if (error) throw new Error(error.message);
+}
+
+/** Keep the last row per key — Postgres forbids duplicate keys in one upsert batch. */
+function dedupeBy<T>(rows: T[], keyOf: (r: T) => string): T[] {
+  const map = new Map<string, T>();
+  for (const r of rows) map.set(keyOf(r), r);
+  return [...map.values()];
 }
 
 /* ───────────────────────── ads ───────────────────────── */
@@ -63,55 +88,45 @@ function fail(error: { message: string } | null) {
 export interface AdFilter { start?: string; end?: string; asin?: string; campaign?: string }
 
 export async function dbQueryAds(country: Country, f: AdFilter = {}): Promise<AdRow[]> {
-  const key = `db:ads:${country}:${f.start ?? ""}:${f.end ?? ""}:${f.asin ?? ""}`;
-  return cached(key, 5 * 60 * 1000, async () =>
-    selectAll<AdRow>((from, to) => {
-      let q = supa().from("ad_rows")
-        .select("date,asin,campaign,spend,sales,orders,clicks,impressions")
-        .eq("country", country);
-      if (f.start) q = q.gte("date", f.start);
-      if (f.end) q = q.lte("date", f.end);
-      if (f.asin) q = q.eq("asin", f.asin);
-      return q.order("date").range(from, to);
-    }),
-  );
-}
-
-export async function dbQueryTargeting(country: Country, f: AdFilter = {}): Promise<TargetingRow[]> {
-  const key = `db:tgt:${country}:${f.start ?? ""}:${f.end ?? ""}:${f.campaign ?? ""}`;
-  return cached(key, 5 * 60 * 1000, async () => {
-    const rows = await selectAll<Omit<TargetingRow, "asin" | "matchType"> & { match_type: string }>((from, to) => {
-      let q = supa().from("targeting_rows")
-        .select("date,campaign,targeting,match_type,spend,sales,orders,clicks,impressions")
-        .eq("country", country);
-      if (f.start) q = q.gte("date", f.start);
-      if (f.end) q = q.lte("date", f.end);
-      if (f.campaign) q = q.eq("campaign", f.campaign);
-      return q.order("date").range(from, to);
-    });
-    return rows.map((r) => ({ ...r, asin: "", matchType: r.match_type }));
+  return selectAll<AdRow>((from, to) => {
+    let q = supa().from("ad_rows")
+      .select("date,asin,campaign,spend,sales,orders,clicks,impressions")
+      .eq("country", country);
+    if (f.start) q = q.gte("date", f.start);
+    if (f.end) q = q.lte("date", f.end);
+    if (f.asin) q = q.eq("asin", f.asin);
+    return q.order("date").order("id").range(from, to);
   });
 }
 
-export async function dbQueryOrders(f: AdFilter = {}): Promise<OrderRow[]> {
-  const key = `db:orders:${f.start ?? ""}:${f.end ?? ""}:${f.asin ?? ""}`;
-  return cached(key, 5 * 60 * 1000, async () =>
-    selectAll<OrderRow>((from, to) => {
-      let q = supa().from("order_rows").select("date,sku,asin,units,sales").eq("country", "IND");
-      if (f.start) q = q.gte("date", f.start);
-      if (f.end) q = q.lte("date", f.end);
-      if (f.asin) q = q.eq("asin", f.asin);
-      return q.order("date").range(from, to);
-    }),
-  );
+export async function dbQueryTargeting(country: Country, f: AdFilter = {}): Promise<TargetingRow[]> {
+  const rows = await selectAll<Omit<TargetingRow, "asin" | "matchType"> & { match_type: string }>((from, to) => {
+    let q = supa().from("targeting_rows")
+      .select("date,campaign,targeting,match_type,spend,sales,orders,clicks,impressions")
+      .eq("country", country);
+    if (f.start) q = q.gte("date", f.start);
+    if (f.end) q = q.lte("date", f.end);
+    if (f.campaign) q = q.eq("campaign", f.campaign);
+    return q.order("date").order("id").range(from, to);
+  });
+  return rows.map((r) => ({ ...r, asin: "", matchType: r.match_type }));
 }
 
-export async function dbInsertAds(country: Country, rows: Omit<AdRow, "asin">[] | AdRow[]) {
-  const payload = (rows as AdRow[]).map((r) => ({ country, ...r }));
+export async function dbQueryOrders(f: AdFilter = {}): Promise<OrderRow[]> {
+  return selectAll<OrderRow>((from, to) => {
+    let q = supa().from("order_rows").select("date,sku,asin,units,sales").eq("country", "IND");
+    if (f.start) q = q.gte("date", f.start);
+    if (f.end) q = q.lte("date", f.end);
+    if (f.asin) q = q.eq("asin", f.asin);
+    return q.order("date").order("id").range(from, to);
+  });
+}
+
+export async function dbInsertAds(country: Country, rows: AdRow[]) {
+  const payload = rows.map((r) => ({ country, ...r }));
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("ad_rows").insert(payload.slice(i, i + PAGE))).error);
   }
-  invalidate(`db:ads:${country}`);
 }
 
 export async function dbInsertTargeting(country: Country, rows: TargetingRow[]) {
@@ -119,7 +134,6 @@ export async function dbInsertTargeting(country: Country, rows: TargetingRow[]) 
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("targeting_rows").insert(payload.slice(i, i + PAGE))).error);
   }
-  invalidate(`db:tgt:${country}`);
 }
 
 export async function dbInsertOrders(rows: OrderRow[]) {
@@ -127,7 +141,6 @@ export async function dbInsertOrders(rows: OrderRow[]) {
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("order_rows").insert(payload.slice(i, i + PAGE))).error);
   }
-  invalidate("db:orders");
 }
 
 export async function dbLatestAdDate(country: Country): Promise<string | null> {
@@ -147,99 +160,90 @@ export async function dbLatestOrderDate(): Promise<string | null> {
 /* ───────────────────────── change logs ───────────────────────── */
 
 export async function dbLoadLogs(): Promise<LogEntry[]> {
-  return cached("db:logs", 60 * 1000, async () => {
-    const rows = await selectAll<{ ts: string; asin: string; campaign: string; comment: string }>(
-      (from, to) => supa().from("change_logs").select("ts,asin,campaign,comment").order("ts", { ascending: false }).range(from, to),
-    );
-    return rows.map((r) => ({ timestamp: r.ts, asin: r.asin, campaign: r.campaign, comment: r.comment }));
-  });
+  const rows = await selectAll<{ ts: string; asin: string; campaign: string; comment: string }>(
+    (from, to) => supa().from("change_logs").select("ts,asin,campaign,comment").order("ts", { ascending: false }).range(from, to),
+  );
+  return rows.map((r) => ({ timestamp: r.ts, asin: r.asin, campaign: r.campaign, comment: r.comment }));
 }
 
 export async function dbAppendLog(asin: string, campaign: string, comment: string) {
   const expiry = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
   fail((await supa().from("change_logs").insert({ asin, campaign, comment, expiry })).error);
-  invalidate("db:logs");
 }
 
 /* ───────────────────────── users / auth ───────────────────────── */
 
 export async function dbListAllowed(): Promise<AllowedUser[]> {
-  return cached("db:allowed", 60 * 1000, async () => {
-    const rows = await selectAll<{ email: string; added_by: string | null; added_at: string | null }>(
-      (from, to) => supa().from("allowed_emails").select("email,added_by,added_at").range(from, to),
-    );
-    return rows.map((r) => ({ email: r.email, role: "member" as const, addedBy: r.added_by ?? "", addedAt: r.added_at ?? "" }));
-  });
+  const rows = await selectAll<{ email: string; added_by: string | null; added_at: string | null }>(
+    (from, to) => supa().from("allowed_emails").select("email,added_by,added_at").order("email").range(from, to),
+  );
+  return rows.map((r) => ({ email: r.email, role: "member" as const, addedBy: r.added_by ?? "", addedAt: r.added_at ?? "" }));
 }
 
 export async function dbAddAllowed(email: string, addedBy: string) {
   fail((await supa().from("allowed_emails").insert({ email, role: "member", added_by: addedBy })).error);
-  invalidate("db:allowed");
 }
 
 export async function dbRemoveAllowed(email: string) {
   fail((await supa().from("allowed_emails").delete().eq("email", email)).error);
-  invalidate("db:allowed");
 }
 
 export async function dbRecordLogin(email: string, userAgent: string) {
   fail((await supa().from("login_events").insert({ email, user_agent: userAgent.slice(0, 200) })).error);
-  invalidate("db:events");
 }
 
 export async function dbListLoginEvents(): Promise<LoginEvent[]> {
-  return cached("db:events", 60 * 1000, async () => {
-    const rows = await selectAll<{ email: string; ts: string; user_agent: string | null }>(
-      (from, to) => supa().from("login_events").select("email,ts,user_agent").order("ts", { ascending: false }).range(from, to),
-    );
-    return rows.map((r) => ({ email: r.email, timestamp: r.ts, userAgent: r.user_agent ?? "" }));
-  });
+  const rows = await selectAll<{ email: string; ts: string; user_agent: string | null }>(
+    (from, to) => supa().from("login_events").select("email,ts,user_agent").order("ts", { ascending: false }).range(from, to),
+  );
+  return rows.map((r) => ({ email: r.email, timestamp: r.ts, userAgent: r.user_agent ?? "" }));
 }
 
 /* ───────────────────────── returns ───────────────────────── */
 
 export async function dbLoadCombinedReturns(): Promise<CombinedRow[]> {
-  return cached("db:returns", 5 * 60 * 1000, async () => {
-    const [returns, sales] = await Promise.all([
-      selectAll<{ order_id: string; asin: string; disposition: string; reason: string; comments: string; return_date: string | null }>(
-        (from, to) => supa().from("fba_returns").select("*").range(from, to),
-      ),
-      selectAll<{ order_id: string; buyer_email: string; title: string; pincode: string }>(
-        (from, to) => supa().from("fulfilled_sales").select("order_id,buyer_email,title,pincode").range(from, to),
-      ),
-    ]);
-    const byOrder = new Map(sales.map((s) => [s.order_id, s]));
-    return returns
-      .filter((r) => r.return_date)
-      .map((r) => {
-        const s = byOrder.get(r.order_id);
-        return {
-          date: r.return_date!,
-          orderId: r.order_id,
-          asin: r.asin,
-          disposition: r.disposition,
-          reason: r.reason,
-          comments: r.comments,
-          buyerEmail: s?.buyer_email ?? "",
-          title: s?.title ?? "",
-          pincode: (s?.pincode ?? "").split(".")[0],
-        };
-      })
-      .sort((a, b) => b.date.localeCompare(a.date));
-  });
+  const [returns, sales] = await Promise.all([
+    selectAll<{ order_id: string; asin: string; disposition: string; reason: string; comments: string; return_date: string | null }>(
+      (from, to) => supa().from("fba_returns").select("*").order("order_id").range(from, to),
+    ),
+    selectAll<{ order_id: string; buyer_email: string; title: string; pincode: string }>(
+      (from, to) => supa().from("fulfilled_sales").select("order_id,buyer_email,title,pincode").order("order_id").range(from, to),
+    ),
+  ]);
+  const byOrder = new Map(sales.map((s) => [s.order_id, s]));
+  return returns
+    .filter((r) => r.return_date)
+    .map((r) => {
+      const s = byOrder.get(r.order_id);
+      return {
+        date: r.return_date!,
+        orderId: r.order_id,
+        asin: r.asin,
+        disposition: r.disposition,
+        reason: r.reason,
+        comments: r.comments,
+        buyerEmail: s?.buyer_email ?? "",
+        title: s?.title ?? "",
+        pincode: (s?.pincode ?? "").split(".")[0],
+      };
+    })
+    .sort((a, b) => b.date.localeCompare(a.date));
 }
 
 export async function dbUpsertReturns(
   rows: { order_id: string; asin: string; disposition: string; reason: string; comments: string; return_date: string | null }[],
   sales: { order_id: string; date: string | null; buyer_email: string; title: string; pincode: string }[],
 ) {
-  for (let i = 0; i < rows.length; i += PAGE) {
-    fail((await supa().from("fba_returns").upsert(rows.slice(i, i + PAGE), { onConflict: "order_id" })).error);
+  // Amazon reports repeat an order id per item — keep the last row per order,
+  // matching the old Sheets dedupe (and Postgres's one-row-per-key upsert rule).
+  const uniqRows = dedupeBy(rows, (r) => r.order_id);
+  const uniqSales = dedupeBy(sales, (s) => s.order_id);
+  for (let i = 0; i < uniqRows.length; i += PAGE) {
+    fail((await supa().from("fba_returns").upsert(uniqRows.slice(i, i + PAGE), { onConflict: "order_id" })).error);
   }
-  for (let i = 0; i < sales.length; i += PAGE) {
-    fail((await supa().from("fulfilled_sales").upsert(sales.slice(i, i + PAGE), { onConflict: "order_id" })).error);
+  for (let i = 0; i < uniqSales.length; i += PAGE) {
+    fail((await supa().from("fulfilled_sales").upsert(uniqSales.slice(i, i + PAGE), { onConflict: "order_id" })).error);
   }
-  invalidate("db:returns");
 }
 
 /* ───────────────────────── sales tracker ───────────────────────── */
@@ -257,7 +261,7 @@ export async function dbTrackerDaily(month: string) {
   const next = `${m === 12 ? y + 1 : y}-${String(m === 12 ? 1 : m + 1).padStart(2, "0")}-01`;
   return selectAll<{ date: string; asin: string; units: number }>((from, to) =>
     supa().from("business_reports_daily").select("date,asin,units")
-      .gte("date", `${month}-01`).lt("date", next).range(from, to),
+      .gte("date", `${month}-01`).lt("date", next).order("date").order("asin").range(from, to),
   );
 }
 
@@ -267,17 +271,19 @@ export async function dbReplaceMonthly(
   top: { asin: string; title: string; avg: number }[],
 ) {
   fail((await supa().from("business_reports_monthly").delete().eq("month", month)).error);
-  const payload = rows.map((r) => ({ month, ...r }));
+  const payload = dedupeBy(rows, (r) => r.asin).map((r) => ({ month, ...r }));
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("business_reports_monthly").upsert(payload.slice(i, i + PAGE), { onConflict: "month,asin" })).error);
   }
   fail((await supa().from("top_asins_monthly_avg").delete().eq("month", month)).error);
-  fail((await supa().from("top_asins_monthly_avg").insert(top.map((t) => ({ month, asin: t.asin, title: t.title, avg_daily_units: t.avg })))).error);
+  fail((await supa().from("top_asins_monthly_avg").insert(
+    dedupeBy(top, (t) => t.asin).map((t) => ({ month, asin: t.asin, title: t.title, avg_daily_units: t.avg })),
+  )).error);
 }
 
 export async function dbReplaceDaily(date: string, rows: { asin: string; title: string; units: number }[]) {
   fail((await supa().from("business_reports_daily").delete().eq("date", date)).error);
-  const payload = rows.map((r) => ({ date, ...r }));
+  const payload = dedupeBy(rows, (r) => r.asin).map((r) => ({ date, ...r }));
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("business_reports_daily").upsert(payload.slice(i, i + PAGE), { onConflict: "date,asin" })).error);
   }
@@ -286,33 +292,31 @@ export async function dbReplaceDaily(date: string, rows: { asin: string; title: 
 /* ───────────────────────── asin health ───────────────────────── */
 
 export async function dbLoadHealth(): Promise<HealthRaw[]> {
-  return cached("db:health", 10 * 60 * 1000, async () => {
-    const rows = await selectAll<{ month: string; asin: string; title: string; sales: number; units: number; sessions: number; usp: number; buy_box: number }>(
-      (from, to) => supa().from("asin_health").select("*").range(from, to),
-    );
-    return rows.map((r) => ({ ...r, buyBox: r.buy_box }));
-  });
+  const rows = await selectAll<{ month: string; asin: string; title: string; sales: number; units: number; sessions: number; usp: number; buy_box: number }>(
+    (from, to) => supa().from("asin_health").select("*").order("month").order("asin").range(from, to),
+  );
+  return rows.map((r) => ({ ...r, buyBox: r.buy_box }));
 }
 
 export async function dbReplaceHealthMonth(month: string, rows: Omit<HealthRaw, "month">[]) {
   fail((await supa().from("asin_health").delete().eq("month", month)).error);
-  const payload = rows.map(({ buyBox, ...r }) => ({ month, buy_box: buyBox, ...r }));
+  const payload = dedupeBy(rows, (r) => r.asin).map(({ buyBox, ...r }) => ({ month, buy_box: buyBox, ...r }));
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("asin_health").upsert(payload.slice(i, i + PAGE), { onConflict: "month,asin" })).error);
   }
-  invalidate("db:health");
 }
 
 export async function dbLoadChecklist(): Promise<ChecklistRow[]> {
-  return cached("db:checklist", 60 * 1000, async () =>
-    selectAll<ChecklistRow>((from, to) => supa().from("checklist_status").select("month,asin,item,status").range(from, to)),
+  return selectAll<ChecklistRow>((from, to) =>
+    supa().from("checklist_status").select("month,asin,item,status").order("month").order("asin").range(from, to),
   );
 }
 
 export async function dbSaveChecklist(month: string, asin: string, items: { item: string; status: boolean }[]) {
   fail((await supa().from("checklist_status").delete().eq("month", month).eq("asin", asin)).error);
-  fail((await supa().from("checklist_status").insert(items.map((i) => ({ month, asin, ...i })))).error);
-  invalidate("db:checklist");
+  fail((await supa().from("checklist_status").insert(
+    dedupeBy(items, (i) => i.item).map((i) => ({ month, asin, ...i })),
+  )).error);
 }
 
 /* ─────────────── serverless-safe auth state (otp + presence) ─────────────── */
@@ -364,29 +368,27 @@ export async function dbPresence(): Promise<Map<string, number>> {
 /* ───────────────────────── voc ───────────────────────── */
 
 export async function dbLoadVoc(): Promise<VocRow[]> {
-  return cached("db:voc", 5 * 60 * 1000, async () => {
-    const rows = await selectAll<{
-      snapshot_date: string; asin: string; product_name: string; sku: string; ncx_rate: string;
-      ncx_orders: string; total_orders: string; star_rating: string; return_rate: string; top_reason: string; status: string;
-    }>((from, to) => supa().from("voc_snapshots").select("*").range(from, to));
-    return rows.map((r) => ({
-      snapshotDate: r.snapshot_date,
-      productName: r.product_name,
-      asin: r.asin,
-      sku: r.sku,
-      ncxRate: r.ncx_rate,
-      ncxOrders: r.ncx_orders,
-      totalOrders: r.total_orders,
-      starRating: r.star_rating,
-      returnRate: r.return_rate,
-      topReason: r.top_reason,
-      status: r.status,
-    }));
-  });
+  const rows = await selectAll<{
+    snapshot_date: string; asin: string; product_name: string; sku: string; ncx_rate: string;
+    ncx_orders: string; total_orders: string; star_rating: string; return_rate: string; top_reason: string; status: string;
+  }>((from, to) => supa().from("voc_snapshots").select("*").order("snapshot_date").order("asin").range(from, to));
+  return rows.map((r) => ({
+    snapshotDate: r.snapshot_date,
+    productName: r.product_name,
+    asin: r.asin,
+    sku: r.sku,
+    ncxRate: r.ncx_rate,
+    ncxOrders: r.ncx_orders,
+    totalOrders: r.total_orders,
+    starRating: r.star_rating,
+    returnRate: r.return_rate,
+    topReason: r.top_reason,
+    status: r.status,
+  }));
 }
 
 export async function dbSaveVocSnapshot(date: string, rows: Omit<VocRow, "snapshotDate">[]) {
-  const payload = rows.map((r) => ({
+  const payload = dedupeBy(rows, (r) => r.asin).map((r) => ({
     snapshot_date: date,
     asin: r.asin,
     product_name: r.productName,
@@ -402,5 +404,4 @@ export async function dbSaveVocSnapshot(date: string, rows: Omit<VocRow, "snapsh
   for (let i = 0; i < payload.length; i += PAGE) {
     fail((await supa().from("voc_snapshots").upsert(payload.slice(i, i + PAGE), { onConflict: "snapshot_date,asin" })).error);
   }
-  invalidate("db:voc");
 }
