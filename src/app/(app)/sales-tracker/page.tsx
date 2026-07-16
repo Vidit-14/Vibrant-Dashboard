@@ -1,9 +1,9 @@
 "use client";
 import { useMemo, useState } from "react";
-import { useApi, fmt, postForm } from "@/lib/client";
+import { useApi, fmt, postForm, downloadCsv } from "@/lib/client";
 import { Button, Card, Dialog, EmptyState, ErrorNote, Field, PageHeader, Spinner, inputCls } from "@/components/ui";
 import { TrendChart, SERIES } from "@/components/charts";
-import { Upload } from "lucide-react";
+import { Download, Upload } from "lucide-react";
 import clsx from "clsx";
 
 interface TrackerRow { asin: string; title: string; avg: number; days: Record<string, number>; total: number }
@@ -38,6 +38,15 @@ export default function SalesTrackerPage() {
       baseline: +baselineTotal.toFixed(1),
     }));
   }, [data]);
+
+  function exportCsv() {
+    if (!data) return;
+    downloadCsv(
+      `daily-sales-tracker-${month}.csv`,
+      ["ASIN", "Title", `Avg/day (${data.baselineMonth})`, "Total", ...data.dates],
+      data.rows.map((r) => [r.asin, r.title, +r.avg.toFixed(1), r.total, ...data.dates.map((d) => r.days[d] ?? 0)]),
+    );
+  }
 
   return (
     <div>
@@ -84,6 +93,12 @@ export default function SalesTrackerPage() {
                 <span className="inline-flex items-center gap-1.5"><span className="inline-block size-2.5 rounded-sm bg-good/25" /> above monthly average</span>
                 <span className="inline-flex items-center gap-1.5"><span className="inline-block size-2.5 rounded-sm bg-critical/20" /> at or below average</span>
                 <span className="inline-flex items-center gap-1.5"><span className="inline-block size-2.5 rounded-sm border border-line" /> zero</span>
+                <button
+                  onClick={exportCsv}
+                  className="ml-auto inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-surface px-2.5 text-xs font-semibold text-ink-2 transition hover:bg-ink/5"
+                >
+                  <Download className="size-3.5" /> CSV
+                </button>
               </div>
 
               <div className="glass mt-2 overflow-x-auto rounded-2xl">
