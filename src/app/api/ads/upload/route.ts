@@ -1,8 +1,9 @@
 import { getSheetValues, appendRows } from "@/lib/google";
 import { invalidate } from "@/lib/cache";
-import { toRecords, parseDate, num, dateKey, safeAsin, findCol } from "@/lib/parse";
-import { parseUpload, adsDateString, toMatrix, type ParsedFile } from "@/lib/upload";
+import { toRecords, parseDate } from "@/lib/parse";
+import { parseUpload, adsDateString, toMatrix } from "@/lib/upload";
 import { COUNTRIES, type Country, type AdRow, type TargetingRow, type OrderRow } from "@/lib/ads";
+import { toAdRows, toTargetingRows, toOrderRows, UPLOAD_CHUNK } from "@/lib/ads-upload";
 import {
   usingSupabase, dbInsertAds, dbInsertTargeting, dbInsertOrders,
   dbLatestAdDate, dbLatestOrderDate,
@@ -19,7 +20,7 @@ export async function GET(request: Request) {
       dbLatestAdDate(country),
       country === "IND" ? dbLatestOrderDate() : Promise.resolve(null),
     ]);
-    return Response.json({ advLatest: adv, ordersLatest: orders });
+    return Response.json({ advLatest: adv, ordersLatest: orders, backend: "db" });
   }
 
   async function latest(sheet: string, dateCol: string): Promise<string | null> {
@@ -40,76 +41,66 @@ export async function GET(request: Request) {
     latest(`Advertised_product_${country}`, "Date"),
     country === "IND" ? latest("Orders_IND", "purchase-date") : Promise.resolve(null),
   ]);
-  return Response.json({ advLatest: adv, ordersLatest: orders });
+  return Response.json({ advLatest: adv, ordersLatest: orders, backend: "sheets" });
 }
 
-/* Normalizers: uploaded report records → clean typed rows (same rules as the loaders). */
+/* JSON chunk branch: the browser parses the xlsx locally and streams typed rows
+   in chunks, so no request ever hits Vercel's ~4.5 MB body limit. Rows are
+   re-mapped field by field — never spread raw client JSON into the DB. */
 
-function toAdRows(parsed: ParsedFile): AdRow[] {
-  const salesCol = findCol(parsed.rows[0] as Record<string, string>, "14 day total sales");
-  const out: AdRow[] = [];
-  for (const r of parsed.rows) {
-    const d = parseDate(String(r["Date"] ?? ""));
-    if (!d) continue;
-    out.push({
-      date: dateKey(d),
-      asin: safeAsin(String(r["Advertised ASIN"] ?? "")),
-      campaign: String(r["Campaign Name"] ?? ""),
-      spend: num(r["Spend"] as string),
-      sales: salesCol ? num(r[salesCol] as string) : 0,
-      orders: num(r["14 Day Total Orders (#)"] as string),
-      clicks: num(r["Clicks"] as string),
-      impressions: num(r["Impressions"] as string),
-    });
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const str = (v: unknown) => String(v ?? "");
+const fin = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+
+interface ChunkBody { country: Country; kind: "adv" | "tgt" | "orders"; rows: Record<string, unknown>[] }
+
+async function handleChunk(request: Request): Promise<Response> {
+  const { country, kind, rows } = (await request.json()) as ChunkBody;
+  if (!COUNTRIES[country]) return Response.json({ error: "bad country" }, { status: 400 });
+  if (!usingSupabase()) return Response.json({ error: "Chunked upload requires the database backend" }, { status: 400 });
+  if (!Array.isArray(rows) || rows.length > UPLOAD_CHUNK * 2) {
+    return Response.json({ error: "bad rows payload" }, { status: 400 });
   }
-  return out;
-}
 
-function toTargetingRows(parsed: ParsedFile): TargetingRow[] {
-  const salesCol = findCol(parsed.rows[0] as Record<string, string>, "14 day total sales");
-  const out: TargetingRow[] = [];
-  for (const r of parsed.rows) {
-    const d = parseDate(String(r["Date"] ?? ""));
-    if (!d) continue;
-    out.push({
-      date: dateKey(d),
-      asin: "",
-      campaign: String(r["Campaign Name"] ?? ""),
-      targeting: String(r["Targeting"] ?? ""),
-      matchType: String(r["Match Type"] ?? ""),
-      spend: num(r["Spend"] as string),
-      sales: salesCol ? num(r[salesCol] as string) : 0,
-      orders: num(r["14 Day Total Orders (#)"] as string),
-      clicks: num(r["Clicks"] as string),
-      impressions: num(r["Impressions"] as string),
-    });
+  const dated = rows.filter((r) => DATE_RE.test(str(r.date)));
+  if (kind === "adv") {
+    const clean: AdRow[] = dated.map((r) => ({
+      date: str(r.date), asin: str(r.asin), campaign: str(r.campaign),
+      spend: fin(r.spend), sales: fin(r.sales), orders: fin(r.orders),
+      clicks: fin(r.clicks), impressions: fin(r.impressions),
+    }));
+    await dbInsertAds(country, clean);
+  } else if (kind === "tgt") {
+    const clean: TargetingRow[] = dated.map((r) => ({
+      date: str(r.date), asin: "", campaign: str(r.campaign),
+      targeting: str(r.targeting), matchType: str(r.matchType),
+      spend: fin(r.spend), sales: fin(r.sales), orders: fin(r.orders),
+      clicks: fin(r.clicks), impressions: fin(r.impressions),
+    }));
+    await dbInsertTargeting(country, clean);
+  } else if (kind === "orders") {
+    if (country !== "IND") return Response.json({ error: "orders are India-only" }, { status: 400 });
+    const clean: OrderRow[] = dated.map((r) => ({
+      date: str(r.date), sku: str(r.sku), asin: str(r.asin),
+      units: fin(r.units), sales: fin(r.sales),
+    }));
+    await dbInsertOrders(clean);
+  } else {
+    return Response.json({ error: "bad kind" }, { status: 400 });
   }
-  return out;
+  return Response.json({ ok: true, inserted: dated.length });
 }
 
-function toOrderRows(parsed: ParsedFile): OrderRow[] {
-  const out: OrderRow[] = [];
-  for (const r of parsed.rows) {
-    const d = parseDate(String(r["purchase-date"] ?? ""));
-    if (!d) continue;
-    const s = (k: string) => r[k] as string;
-    out.push({
-      date: dateKey(d),
-      sku: String(r["sku"] ?? ""),
-      asin: safeAsin(String(r["asin"] ?? "")),
-      units: num(s("quantity")),
-      sales:
-        num(s("item-price")) + num(s("item-tax")) +
-        num(s("shipping-price")) + num(s("shipping-tax")) +
-        num(s("gift-wrap-price")) + num(s("gift-wrap-tax")) -
-        num(s("item-promotion-discount")) - num(s("ship-promotion-discount")),
-    });
-  }
-  return out;
-}
-
-/** POST multipart: adv (xlsx), tgt (xlsx), optional orders (xlsx/csv, India). */
+/** POST — JSON: one chunk of pre-parsed rows; multipart: adv/tgt/orders files (Sheets or small uploads). */
 export async function POST(request: Request) {
+  if (request.headers.get("content-type")?.includes("application/json")) {
+    try {
+      return await handleChunk(request);
+    } catch (e) {
+      return Response.json({ error: (e as Error).message }, { status: 500 });
+    }
+  }
+
   const form = await request.formData();
   const country = (form.get("country") as string) as Country;
   const adv = form.get("adv") as File | null;
@@ -122,16 +113,16 @@ export async function POST(request: Request) {
     const results: Record<string, number> = {};
 
     if (usingSupabase()) {
-      const advRows = toAdRows(await parseUpload(adv));
+      const advRows = toAdRows((await parseUpload(adv)).rows);
       await dbInsertAds(country, advRows);
       results[`Advertised_product_${country}`] = advRows.length;
 
-      const tgtRows = toTargetingRows(await parseUpload(tgt));
+      const tgtRows = toTargetingRows((await parseUpload(tgt)).rows);
       await dbInsertTargeting(country, tgtRows);
       results[`Targeting_${country}`] = tgtRows.length;
 
       if (orders && country === "IND") {
-        const orderRows = toOrderRows(await parseUpload(orders));
+        const orderRows = toOrderRows((await parseUpload(orders)).rows);
         await dbInsertOrders(orderRows);
         results["Orders_IND"] = orderRows.length;
       }

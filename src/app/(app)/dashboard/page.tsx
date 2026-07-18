@@ -335,36 +335,68 @@ function RecentLogsDialog({ open, onClose }: { open: boolean; onClose: () => voi
 }
 
 function UploadDialog({ open, onClose, country, onDone }: { open: boolean; onClose: () => void; country: "IND" | "USA"; onDone: () => void }) {
-  const { data: latest } = useApi<{ advLatest: string | null; ordersLatest: string | null }>(
+  const { data: latest } = useApi<{ advLatest: string | null; ordersLatest: string | null; backend?: string }>(
     open ? `/api/ads/upload?country=${country}` : null,
   );
   const [adv, setAdv] = useState<File | null>(null);
   const [tgt, setTgt] = useState<File | null>(null);
   const [orders, setOrders] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<string | null>(null);
 
   const nextDay = (d: string | null) =>
     d ? new Date(Date.parse(d) + 86400000).toISOString().slice(0, 10) : "your earliest available date";
 
+  /** Parse xlsx in the browser and stream typed rows in chunks — the raw files
+      can exceed Vercel's ~4.5 MB request limit, small JSON chunks never do. */
+  async function submitChunked() {
+    const { parseReportFile, toAdRows, toTargetingRows, toOrderRows, UPLOAD_CHUNK } = await import("@/lib/ads-upload");
+    const results: Record<string, number> = {};
+    const jobs: { kind: "adv" | "tgt" | "orders"; label: string; file: File; normalize: (r: Awaited<ReturnType<typeof parseReportFile>>) => { date: string }[] }[] = [
+      { kind: "adv", label: "Advertised Product", file: adv!, normalize: toAdRows },
+      { kind: "tgt", label: "Targeting", file: tgt!, normalize: toTargetingRows },
+      ...(orders && country === "IND" ? [{ kind: "orders" as const, label: "Orders", file: orders, normalize: toOrderRows }] : []),
+    ];
+    for (const job of jobs) {
+      setProgress(`Reading ${job.label} report…`);
+      const rows = job.normalize(await parseReportFile(job.file));
+      let sent = 0;
+      for (let i = 0; i < rows.length; i += UPLOAD_CHUNK) {
+        setProgress(`Uploading ${job.label}: ${Math.min(i + UPLOAD_CHUNK, rows.length).toLocaleString()} / ${rows.length.toLocaleString()} rows…`);
+        const res = await postJson<{ inserted: number }>("/api/ads/upload", { country, kind: job.kind, rows: rows.slice(i, i + UPLOAD_CHUNK) });
+        sent += res.inserted;
+      }
+      results[job.label] = sent;
+    }
+    return results;
+  }
+
   async function submit() {
     if (!adv || !tgt) { setErr("Please attach both the Advertised Product and Targeting reports."); return; }
     setBusy(true); setErr(null); setDone(null);
     try {
-      const form = new FormData();
-      form.set("country", country);
-      form.set("adv", adv);
-      form.set("tgt", tgt);
-      if (orders) form.set("orders", orders);
-      const res = await postForm<{ appended: Record<string, number> }>("/api/ads/upload", form);
-      setDone(Object.entries(res.appended).map(([k, v]) => `${k}: +${v} rows`).join(" · "));
+      let results: Record<string, number>;
+      if (latest?.backend === "db") {
+        results = await submitChunked();
+      } else {
+        const form = new FormData();
+        form.set("country", country);
+        form.set("adv", adv);
+        form.set("tgt", tgt);
+        if (orders) form.set("orders", orders);
+        const res = await postForm<{ appended: Record<string, number> }>("/api/ads/upload", form);
+        results = res.appended;
+      }
+      setDone(Object.entries(results).map(([k, v]) => `${k}: +${v} rows`).join(" · "));
       setAdv(null); setTgt(null); setOrders(null);
       onDone();
     } catch (e) {
       setErr((e as Error).message);
     } finally {
       setBusy(false);
+      setProgress(null);
     }
   }
 
@@ -394,6 +426,7 @@ function UploadDialog({ open, onClose, country, onDone }: { open: boolean; onClo
         )}
         {err && <ErrorNote message={err} />}
         {done && <div className="rounded-lg bg-good/10 px-3 py-2 text-sm text-[var(--delta-good)]">Appended — {done}</div>}
+        {busy && progress && <div className="tnum text-xs text-ink-3">{progress}</div>}
         <Button onClick={submit} disabled={busy}>{busy ? "Uploading…" : "Process & append"}</Button>
       </div>
     </Dialog>
