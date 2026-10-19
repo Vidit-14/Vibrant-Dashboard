@@ -295,9 +295,11 @@ export async function dbLoadHealth(): Promise<HealthRaw[]> {
   const rows = await selectAll<{ month: string; asin: string; title: string; sales: number; units: number; sessions: number; usp: number; buy_box: number }>(
     (from, to) => supa().from("asin_health").select("*").order("month").order("asin").range(from, to),
   );
-  return rows.map((r) => ({ ...r, buyBox: r.buy_box }));
+  // usp / buy_box are stored as whole percents (5.45 = 5.45%); the app works in fractions
+  return rows.map((r) => ({ ...r, usp: r.usp / 100, buyBox: r.buy_box / 100 }));
 }
 
+/** Rows carry usp / buyBox as whole percents (5.45 = 5.45%), matching how they are stored. */
 export async function dbReplaceHealthMonth(month: string, rows: Omit<HealthRaw, "month">[]) {
   fail((await supa().from("asin_health").delete().eq("month", month)).error);
   const payload = dedupeBy(rows, (r) => r.asin).map(({ buyBox, ...r }) => ({ month, buy_box: buyBox, ...r }));

@@ -48,6 +48,11 @@ export function num(v: string | number | undefined | null): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+/** Coerce a percentage to a fraction: "5.45%" → 0.0545. Values without "%" are taken as already fractional. */
+export function pct(v: string | number | undefined | null): number {
+  return typeof v === "string" && v.includes("%") ? num(v) / 100 : num(v);
+}
+
 /** Normalise ASIN values stored as floats ("1636513352.0" → "1636513352"). */
 export function safeAsin(v: string | number | undefined | null): string {
   const s = String(v ?? "").trim();

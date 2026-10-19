@@ -123,8 +123,8 @@ create table if not exists asin_health (
   sales    double precision not null default 0,
   units    double precision not null default 0,
   sessions double precision not null default 0,
-  usp      double precision not null default 0,
-  buy_box  double precision not null default 0,
+  usp      double precision not null default 0,  -- whole percent (5.45 = 5.45%)
+  buy_box  double precision not null default 0,  -- whole percent
   primary key (month, asin)
 );
 

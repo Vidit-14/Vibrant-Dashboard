@@ -1,7 +1,7 @@
 import "server-only";
 import { getSheetValues, overwriteSheet, ensureSheet } from "./google";
 import { cached, invalidate } from "./cache";
-import { toRecords, num, safeAsin } from "./parse";
+import { toRecords, num, pct, safeAsin } from "./parse";
 import { usingSupabase, dbLoadHealth, dbLoadChecklist, dbSaveChecklist } from "./db";
 
 export const CHECKLISTS: Record<string, string[]> = {
@@ -39,8 +39,8 @@ export interface HealthRaw {
   sales: number;
   units: number;
   sessions: number;
-  usp: number; // unit session percentage
-  buyBox: number; // featured offer percentage
+  usp: number; // unit session percentage, as a fraction (0.0545 = 5.45%)
+  buyBox: number; // featured offer percentage, as a fraction
 }
 
 export async function loadHealth(): Promise<HealthRaw[]> {
@@ -58,8 +58,8 @@ export async function loadHealth(): Promise<HealthRaw[]> {
         sales: num(r["Ordered Product Sales"]),
         units: num(r["Units Ordered"]),
         sessions: num(r["Sessions - Total"]),
-        usp: num(r["Unit Session Percentage"]),
-        buyBox: num(r["Featured Offer Percentage"]),
+        usp: pct(r["Unit Session Percentage"]),
+        buyBox: pct(r["Featured Offer Percentage"]),
       });
     }
     return out;
